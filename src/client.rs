@@ -2,6 +2,8 @@ use std::io::Cursor;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, SystemTime};
 
+use hickory_resolver::{ResolveError, Resolver};
+
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,7 +55,7 @@ impl McClient {
 
     pub async fn ping_java(&self, address: &str) -> Result<ServerStatus, McError> {
         let start = SystemTime::now();
-        let (host, port) = Self::parse_address(address, 25565)?;
+        let (host, port) = Self::resolve_mc_srv_record(address, 25565).await?;
         let resolved = self.resolve_dns(host, port).await?;
         let dns_info = self.get_dns_info(host).await.ok(); // DNS info is optional
 
@@ -155,13 +157,47 @@ impl McClient {
     }
 
     // Helper methods
-    fn parse_address(address: &str, default_port: u16) -> Result<(&str, u16), McError> {
-        if let Some((host, port_str)) = address.split_once(':') {
-            let port = port_str.parse::<u16>()
+    fn _url_parse(address: &str) -> Result<(&str, Option<u16>), McError> {
+        if let Some((host, port_str)) = address.rsplit_once(':') {
+            let port = port_str
+                .parse::<u16>()
                 .map_err(|e| McError::InvalidPort(e.to_string()))?;
+            Ok((host, Some(port)))
+        } else {
+            Ok((address, None))
+        }
+    }
+
+    fn parse_address(address: &str, default_port: u16) -> Result<(&str, u16), McError> {
+        let (host, port) = Self::_url_parse(address)?;
+        if let Some(port) = port {
             Ok((host, port))
         } else {
             Ok((address, default_port))
+        }
+    }
+
+    async fn resolve_srv_record(host: &str) -> Result<Option<u16>, ResolveError> {
+        let resolver = Resolver::builder_tokio()?.build();
+        let response = resolver.srv_lookup(host).await?;
+        Ok(response.iter().next().map(|r| r.port()))
+    }
+
+    async fn resolve_mc_srv_record(
+        address: &str,
+        default_port: u16,
+    ) -> Result<(&str, u16), McError> {
+        let (host, port) = Self::_url_parse(address)?;
+        if let Some(port) = port {
+            Ok((host, port))
+        } else {
+            if let Ok(Some(port)) =
+                Self::resolve_srv_record(&format!("_minecraft._tcp.{}", host)).await
+            {
+                Ok((host, port))
+            } else {
+                Ok((host, default_port))
+            }
         }
     }
 
